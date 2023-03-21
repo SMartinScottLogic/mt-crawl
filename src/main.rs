@@ -1,3 +1,6 @@
+#![feature(proc_macro_hygiene, decl_macro)]
+#[macro_use] extern crate rocket;
+
 use chrono::{Datelike, Utc};
 use crossbeam::channel::{Receiver, Sender};
 use crossbeam::deque::{
@@ -12,6 +15,8 @@ use serde_derive::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::hash::Hasher;
+use std::io::Read;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::thread;
 
@@ -139,15 +144,16 @@ fn run_thread(
                     thread::current().name().unwrap_or("None"),
                     uri
                 );
-                if let Ok(resp) = client.get(&uri).send() {
-                    match lit.process(&uri, &config, resp) {
+                match client.get(&uri).send() {
+                    Ok(resp) => match lit.process(&uri, &config, resp) {
                         Ok(data) => s.send(data).unwrap(),
                         Err(e) => error!("{} => {}", uri, e),
-                    }
+                    },
+                    Err(e) => error!("{uri} => {e}"),
                 }
             }
             Retry => (),
-            Empty => break,
+            Empty => (),
         }
     }
     info!("{}: done", thread::current().name().unwrap_or("None"));
@@ -177,6 +183,30 @@ fn receiver(
         }
     }
     info!("Receiver completed.");
+}
+
+#[post("/", format="plain", data="<uri>")]
+fn add(uri: rocket::Data, s: rocket::State<Sender<(Story, HashSet<(Url, bool)>)>>) {
+    let mut stream = uri.open();
+
+    let mut buf = String::new();
+    stream.read_to_string(&mut buf).unwrap();
+    info!("{buf}");
+
+    let story = Story::new();
+    let mut links = HashSet::new();
+    links.insert((Url::from_str(&buf).unwrap(), true));
+    s.send((story, links));
+}
+
+#[get("/")]
+fn ping(s: rocket::State<Sender<(Story, HashSet<(Url, bool)>)>>) -> &'static str {
+    info!("ping");
+    let story = Story::new();
+    let mut links = HashSet::new();
+    links.insert((Url::from_str("huh://nonsense").unwrap(), true));
+    s.send((story, links));
+    "pong"
 }
 
 fn main() {
@@ -215,6 +245,15 @@ fn main() {
                 receiver(r, &q, known_urls);
             })
             .unwrap();
-    })
-    .unwrap();
+        scope
+            .builder()
+            .name("rocket".to_string())
+            .spawn(|_| {
+                rocket::ignite()
+                //.manage(&q)
+                .manage(s.clone())
+                .mount("/", rocket::routes![add, ping])
+                .launch()
+            }).unwrap();
+    }).unwrap();
 }

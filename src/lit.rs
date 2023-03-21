@@ -18,6 +18,12 @@ const NAME_ATTR: &str = "name";
 const KEYWORDS: &str = "keywords";
 const CONTENT: &str = "content";
 
+impl Default for Lit {
+    fn default() -> Self {
+    Self::new()
+    }
+}
+
 impl Lit {
     pub fn new() -> Lit {
         Lit {}

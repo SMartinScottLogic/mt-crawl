@@ -1,0 +1,51 @@
+[package]
+name = "mt-crawl"
+version = "0.1.0"
+authors = ["Simon Martin <havvoric@gmail.com>"]
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+num_cpus = "^1.13.0"
+bson = "2.2.0"
+crossbeam = "0.8"
+
+# A generic serialization/deserialization framework
+serde = "1.0.125"
+serde_derive = "1.0.124"
+# A JSON serialization file format
+serde_json = "1.0.64"
+# YAML support for Serde
+serde_yaml = "0.9.16"
+
+# higher level HTTP client library
+reqwest = { version = "^0.11.2", features = ["gzip", "brotli", "blocking"] }
+
+# A lightweight logging facade for Rust 
+log = "0.4.6"
+# A logging implementation for `log` which is configured via an environment variable.
+env_logger = "0.10.0"
+# A library to extract useful data from HTML documents, suitable for web scraping.
+select = "0.6.0"
+
+# An implementation of regular expressions for Rust. This implementation uses finite automata and gua…
+regex = "1.4.5"
+
+# This crate provides Grapheme Cluster, Word and Sentence boundaries according to Unicode Stand…
+unicode-segmentation = "1.7.1"
+
+# Extra iterator adaptors, iterator methods, free functions, and macros.
+itertools = "0.10.3"
+
+# Recursively walk a directory.
+walkdir = "2.3.2"
+
+# A simple to use, efficient, and full-featured Command Line Argument Parser
+clap = {version = "4.1.4", features = ["derive"]}
+
+# A macro for declaring lazily evaluated statics in Rust.
+lazy_static = "1.4.0"
+
+# Date and time library for Rust
+chrono = "0.4.19"

@@ -10,6 +10,7 @@ use crossbeam::deque::{
 use mt_crawl::Story;
 use reqwest::blocking::Client;
 use reqwest::Url;
+use rocket::fairing::AdHoc;
 use rocket::tokio::time::{sleep, Duration};
 use rocket::State;
 use rocket_prometheus::PrometheusMetrics;
@@ -133,11 +134,13 @@ impl<T> PriorityInjector<T> {
     }
 }
 
-fn run_thread(
-    q: &PriorityInjector<String>,
-    s: Sender<(Story, HashSet<(Url, bool)>)>,
-    config: Arc<CrawlConfig>,
-) {
+#[derive(Debug)]
+enum Message {
+    Shutdown,
+    Links(Story, HashSet<(Url, bool)>),
+}
+
+fn run_thread(q: &PriorityInjector<String>, s: Sender<Message>, config: Arc<CrawlConfig>) {
     let client = Client::new();
     let lit = Lit::new();
     loop {
@@ -153,9 +156,16 @@ fn run_thread(
                 );
                 match client.get(&uri).send() {
                     Ok(resp) => match lit.process(&uri, &config, resp) {
-                        Ok(data) => {
+                        Ok((story, links)) => {
                             info!("{uri}");
-                            s.send(data).unwrap()
+                            match s.try_send(Message::Links(story, links)) {
+                                Ok(_) => (),
+                                Err(crossbeam::channel::TrySendError::Disconnected(m)) => {
+                                    debug!("disconnection detected while sending {m:?}");
+                                    break;
+                                }
+                                Err(e) => error!("send error from crawl thread: {e:?}"),
+                            }
                         }
                         Err(e) => error!("{} => {}", uri, e),
                     },
@@ -170,7 +180,7 @@ fn run_thread(
 }
 
 async fn receiver(
-    r: Receiver<(Story, HashSet<(Url, bool)>)>,
+    r: Receiver<Message>,
     q: &PriorityInjector<String>,
     mut known_urls: impl KnownURL,
 ) -> std::io::Result<()> {
@@ -180,22 +190,26 @@ async fn receiver(
             sleep(Duration::from_millis(100)).await;
             continue;
         }
-        if let Ok((story, links)) = r.recv_timeout(Duration::from_millis(100)) {
-            debug!("{:?} -> {:?}", story, links);
-            let uri = story.get_uri();
-            if let Err(e) = story.write(&archive_root) {
-                error!("did not write {uri}: {e}");
-            };
-            let str_links = links
-                .iter()
-                .map(|(link, priority)| (link.as_str().to_string(), priority))
-                .filter(|(link, _priority)| !known_urls.contains(link))
-                .collect::<Vec<_>>();
-            debug!("{} => {:?}", uri, str_links);
-            for (link, priority) in str_links {
-                known_urls.insert(&link);
-                q.push(link, *priority);
+        match r.recv_timeout(Duration::from_millis(100)) {
+            Ok(Message::Shutdown) => break,
+            Ok(Message::Links(story, links)) => {
+                debug!("{:?} -> {:?}", story, links);
+                let uri = story.get_uri();
+                if let Err(e) = story.write(&archive_root) {
+                    error!("did not write {uri}: {e}");
+                };
+                let str_links = links
+                    .iter()
+                    .map(|(link, priority)| (link.as_str().to_string(), priority))
+                    .filter(|(link, _priority)| !known_urls.contains(link))
+                    .collect::<Vec<_>>();
+                debug!("{} => {:?}", uri, str_links);
+                for (link, priority) in str_links {
+                    known_urls.insert(&link);
+                    q.push(link, *priority);
+                }
             }
+            Err(e) => debug!("{e:?}"),
         }
     }
 
@@ -203,7 +217,7 @@ async fn receiver(
     Ok(())
 }
 
-type StoryState = State<Sender<(Story, HashSet<(Url, bool)>)>>;
+type StoryState = State<Sender<Message>>;
 
 #[post("/", data = "<uri>")]
 async fn add(uri: rocket::Data<'_>, s: &StoryState) -> &'static str {
@@ -216,7 +230,7 @@ async fn add(uri: rocket::Data<'_>, s: &StoryState) -> &'static str {
     let story = Story::new();
     let mut links = HashSet::new();
     links.insert((Url::from_str(&buf).unwrap(), true));
-    s.send((story, links)).unwrap();
+    s.send(Message::Links(story, links)).unwrap();
     "Ok"
 }
 
@@ -226,7 +240,7 @@ async fn ping(s: &StoryState) -> &'static str {
     let story = Story::new();
     let mut links = HashSet::new();
     links.insert((Url::from_str("huh://nonsense").unwrap(), true));
-    s.send((story, links)).unwrap();
+    s.send(Message::Links(story, links)).unwrap();
     "pong"
 }
 
@@ -249,7 +263,7 @@ async fn main() {
 
     let config = Arc::new(config);
 
-    let (s, r) = crossbeam::channel::unbounded::<(Story, HashSet<(Url, bool)>)>();
+    let (s, r) = crossbeam::channel::unbounded::<Message>();
     let threads = (0..config.threads)
         .map(|i| {
             let q = q.clone();
@@ -271,6 +285,12 @@ async fn main() {
         .attach(prometheus.clone())
         .mount("/", rocket::routes![add, ping])
         .mount("/metrics", prometheus)
+        .attach(AdHoc::on_shutdown("Shutdown Printer", |_| {
+            Box::pin(async move {
+                s.send(Message::Shutdown);
+                println!("...shutdown has commenced!");
+            })
+        }))
         .launch();
 
     futures::join!(receiver, server);

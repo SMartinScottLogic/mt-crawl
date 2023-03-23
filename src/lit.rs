@@ -20,7 +20,7 @@ const CONTENT: &str = "content";
 
 impl Default for Lit {
     fn default() -> Self {
-    Self::new()
+        Self::new()
     }
 }
 

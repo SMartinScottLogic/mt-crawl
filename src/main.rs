@@ -1,5 +1,5 @@
-#![feature(proc_macro_hygiene, decl_macro)]
-#[macro_use] extern crate rocket;
+#[macro_use]
+extern crate rocket;
 
 use chrono::{Datelike, Utc};
 use crossbeam::channel::{Receiver, Sender};
@@ -7,18 +7,22 @@ use crossbeam::deque::{
     Injector, Steal,
     Steal::{Empty, Retry, Success},
 };
-use crossbeam::scope;
 use mt_crawl::Story;
 use reqwest::blocking::Client;
 use reqwest::Url;
+use rocket::tokio::time::{sleep, Duration};
+use rocket::State;
+use rocket_prometheus::PrometheusMetrics;
 use serde_derive::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::hash::Hasher;
-use std::io::Read;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::thread;
+
+use rocket::data::ToByteUnit;
+use rocket::tokio::io::AsyncReadExt;
 
 #[macro_use]
 extern crate log;
@@ -138,6 +142,9 @@ fn run_thread(
     let lit = Lit::new();
     loop {
         match q.steal() {
+            Success(stop) if stop == "STOP" => {
+                break;
+            }
             Success(uri) => {
                 debug!(
                     "{}: received {}",
@@ -146,7 +153,10 @@ fn run_thread(
                 );
                 match client.get(&uri).send() {
                     Ok(resp) => match lit.process(&uri, &config, resp) {
-                        Ok(data) => s.send(data).unwrap(),
+                        Ok(data) => {
+                            info!("{uri}");
+                            s.send(data).unwrap()
+                        }
                         Err(e) => error!("{} => {}", uri, e),
                     },
                     Err(e) => error!("{uri} => {e}"),
@@ -159,60 +169,72 @@ fn run_thread(
     info!("{}: done", thread::current().name().unwrap_or("None"));
 }
 
-fn receiver(
+async fn receiver(
     r: Receiver<(Story, HashSet<(Url, bool)>)>,
     q: &PriorityInjector<String>,
     mut known_urls: impl KnownURL,
-) {
+) -> std::io::Result<()> {
     let archive_root = String::from("archive/archive.") + &START_DATE;
-    while let Ok((story, links)) = r.recv() {
-        debug!("{:?} -> {:?}", story, links);
-        let uri = story.get_uri();
-        if let Err(e) = story.write(&archive_root) {
-            error!("did not write {uri}: {e}");
-        };
-        let str_links = links
-            .iter()
-            .map(|(link, priority)| (link.as_str().to_string(), priority))
-            .filter(|(link, _priority)| !known_urls.contains(link))
-            .collect::<Vec<_>>();
-        debug!("{} => {:?}", uri, str_links);
-        for (link, priority) in str_links {
-            known_urls.insert(&link);
-            q.push(link, *priority);
+    loop {
+        if r.is_empty() {
+            sleep(Duration::from_millis(100)).await;
+            continue;
+        }
+        if let Ok((story, links)) = r.recv_timeout(Duration::from_millis(100)) {
+            debug!("{:?} -> {:?}", story, links);
+            let uri = story.get_uri();
+            if let Err(e) = story.write(&archive_root) {
+                error!("did not write {uri}: {e}");
+            };
+            let str_links = links
+                .iter()
+                .map(|(link, priority)| (link.as_str().to_string(), priority))
+                .filter(|(link, _priority)| !known_urls.contains(link))
+                .collect::<Vec<_>>();
+            debug!("{} => {:?}", uri, str_links);
+            for (link, priority) in str_links {
+                known_urls.insert(&link);
+                q.push(link, *priority);
+            }
         }
     }
+
     info!("Receiver completed.");
+    Ok(())
 }
 
-#[post("/", format="plain", data="<uri>")]
-fn add(uri: rocket::Data, s: rocket::State<Sender<(Story, HashSet<(Url, bool)>)>>) {
-    let mut stream = uri.open();
+type StoryState = State<Sender<(Story, HashSet<(Url, bool)>)>>;
+
+#[post("/", data = "<uri>")]
+async fn add(uri: rocket::Data<'_>, s: &StoryState) -> &'static str {
+    let mut stream = uri.open(1.kilobytes());
 
     let mut buf = String::new();
-    stream.read_to_string(&mut buf).unwrap();
+    stream.read_to_string(&mut buf).await.unwrap();
     info!("{buf}");
 
     let story = Story::new();
     let mut links = HashSet::new();
     links.insert((Url::from_str(&buf).unwrap(), true));
-    s.send((story, links));
+    s.send((story, links)).unwrap();
+    "Ok"
 }
 
 #[get("/")]
-fn ping(s: rocket::State<Sender<(Story, HashSet<(Url, bool)>)>>) -> &'static str {
+async fn ping(s: &StoryState) -> &'static str {
     info!("ping");
     let story = Story::new();
     let mut links = HashSet::new();
     links.insert((Url::from_str("huh://nonsense").unwrap(), true));
-    s.send((story, links));
+    s.send((story, links)).unwrap();
     "pong"
 }
 
-fn main() {
+#[rocket::main]
+async fn main() {
     env_logger::init();
 
-    let q: PriorityInjector<String> = PriorityInjector::new();
+    let q = Arc::new(PriorityInjector::<String>::new());
     let mut known_urls = KnownURLHashSet::default();
 
     let f = std::fs::File::open("config.yaml").unwrap();
@@ -227,33 +249,32 @@ fn main() {
 
     let config = Arc::new(config);
 
-    let (s, r) = crossbeam::channel::unbounded();
-    scope(|scope| {
-        for t in 0..config.threads {
-            scope
-                .builder()
-                .name(format!("thread {t}"))
-                .spawn(|_| {
+    let (s, r) = crossbeam::channel::unbounded::<(Story, HashSet<(Url, bool)>)>();
+    let threads = (0..config.threads)
+        .map(|i| {
+            let q = q.clone();
+            let s = s.clone();
+            let config = config.clone();
+            thread::Builder::new()
+                .name(format!("thread{i}"))
+                .spawn(move || {
                     run_thread(&q, s.clone(), config.clone());
                 })
-                .unwrap();
-        }
-        scope
-            .builder()
-            .name("receiver".to_string())
-            .spawn(|_| {
-                receiver(r, &q, known_urls);
-            })
-            .unwrap();
-        scope
-            .builder()
-            .name("rocket".to_string())
-            .spawn(|_| {
-                rocket::ignite()
-                //.manage(&q)
-                .manage(s.clone())
-                .mount("/", rocket::routes![add, ping])
-                .launch()
-            }).unwrap();
-    }).unwrap();
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+
+    let receiver = receiver(r, &q, known_urls);
+    let prometheus = PrometheusMetrics::new();
+    let server = rocket::build()
+        .manage(s.clone())
+        .attach(prometheus.clone())
+        .mount("/", rocket::routes![add, ping])
+        .mount("/metrics", prometheus)
+        .launch();
+
+    futures::join!(receiver, server);
+    for thread in threads {
+        thread.join().unwrap();
+    }
 }
